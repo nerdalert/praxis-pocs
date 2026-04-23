@@ -25,7 +25,9 @@ Client → Gateway → Praxis
 ```
 
 No ext-proc hop. No gRPC sidecar. No Wasm shim. Body
-inspection happens inline in the proxy.
+inspection happens inline in the proxy, and the validation
+also proves the original request body reaches the selected
+upstream backend intact.
 
 ## What is replaced
 
@@ -60,3 +62,11 @@ inspection happens inline in the proxy.
 ```bash
 ./demos/bbr-replacement/validate.sh
 ```
+
+The validation asserts all of the following:
+
+- `model=qwen` routes to the `qwen` backend
+- `model=mistral` routes to the `mistral` backend
+- requests without a `model` field fall through to the default route
+- the backend receives and echoes the original request body
+- auth failures still return `401`

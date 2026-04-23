@@ -49,12 +49,12 @@ No ext-proc hop. No gRPC sidecar. No Wasm shim.
 
 | Issue | Detail | Fix needed |
 |---|---|---|
-| StreamBuffer + external TLS | `model_to_header` (body inspection) + external provider in the same request path causes "Connection reset by peer" from Cloudflare. Likely chunked encoding mismatch after StreamBuffer releases the body. | Debug Pingora's body forwarding after StreamBuffer pre-read. Workaround: split body inspection and provider routing into separate demos (current approach). |
+| StreamBuffer + external TLS, single-hop path | The underlying StreamBuffer body-forwarding bug is now fixed and Demo 1 validates forwarding to body-reading backends. What remains unvalidated is collapsing body inspection and external TLS egress into one combined demo path again. | Re-test the single-hop `model_to_header` + external provider route and collapse the demos if it passes. |
 | api-translation plugin | Praxis can't translate between provider API schemas (e.g. OpenAI → Anthropic format) | New feature — not started |
 | Secret-backed credentials | API key is currently hardcoded in the ConfigMap, not sourced from a K8s Secret | New feature — needs Secret mount + injection |
 | MaaS gpt-4o route (404) | Not a Praxis bug — ext-proc isn't deployed because Praxis replaces it. The existing MaaS model route has no body processor. | Deploy ext-proc alongside if you want both paths, or migrate the gpt-4o route to Praxis |
 
-**TLDR:** Praxis replaces 6 of 7 ext-proc/BBR components. The two demos work end-to-end — body-based model routing (Demo 1) and real OpenAI provider egress (Demo 2). The one gap is combining body inspection with external TLS in a single request path, which needs a StreamBuffer fix.
+**TLDR:** Praxis replaces 6 of 7 ext-proc/BBR components. The two demos work end-to-end — body-based model routing with verified body forwarding (Demo 1) and real OpenAI provider egress (Demo 2). The remaining open question is whether those can now be collapsed back into a single demo path after the StreamBuffer forwarding fix.
 
 ## Demos
 

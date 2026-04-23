@@ -85,6 +85,7 @@ spec:
       containers:
         - name: praxis
           image: ghcr.io/nerdalert/praxis:maas-dev
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
