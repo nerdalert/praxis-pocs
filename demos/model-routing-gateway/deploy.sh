@@ -12,8 +12,9 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
   exit 1
 fi
 
-# Ensure namespace
+# Ensure namespace without Istio sidecar injection
 oc create namespace llm 2>/dev/null || true
+oc label namespace llm istio-injection- 2>/dev/null || true
 
 # Apply manifests
 echo "Deploying manifests..."

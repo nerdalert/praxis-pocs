@@ -6,8 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "=== BBR Replacement Demo ==="
 echo ""
 
-# Ensure namespace
+# Ensure namespace without Istio sidecar injection
 oc create namespace llm 2>/dev/null || true
+oc label namespace llm istio-injection- 2>/dev/null || true
 
 # Deploy manifests (backends + praxis + route + policies)
 echo "Deploying manifests..."
