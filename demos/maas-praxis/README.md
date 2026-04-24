@@ -5,122 +5,325 @@ MaaS by doing body-aware routing, credential injection,
 and provider egress inline — no gRPC sidecar, no Wasm,
 no external processor.
 
+This demo validates Praxis as a drop-in replacement for
+the body-processing data path in a production MaaS stack,
+while preserving the full MaaS auth, subscription, and
+rate-limiting flow.
+
 ## Current Status
 
 | Test | Result |
 |------|--------|
 | Body-based model routing (mock backends) | **Passing** |
 | Body forwarding verified (upstream echoes body) | **Passing** |
-| External model via Praxis → OpenAI | **Passing** |
-| MaaS API key auth → Praxis → OpenAI | **Passing** |
+| External model via Praxis → OpenAI (direct path) | **Passing** |
+| External model via MaaS API key → Praxis → OpenAI | **Passing** |
 | In-cluster model (facebook/opt-125m simulator) | **Passing** |
-| Auth rejection (bogus keys, no auth) | **Passing** |
+| MaaS API key minting via subscription | **Passing** |
+| Auth rejection (bogus keys, no auth, header injection) | **Passing** |
+| Model listing (`/v1/models`) | **Passing** |
+
+## Patches and Changes Required
+
+Three repositories are modified for this integration.
+No changes are made to `models-as-a-service` source code —
+only install-time patches to the running cluster.
+
+### 1. Praxis — [`nerdalert/praxis`](https://github.com/nerdalert/praxis/tree/feat/dns-and-request-headers)
+
+Branch: `feat/dns-and-request-headers`
+
+| Commit | Change | Why |
+|--------|--------|-----|
+| `9888295` | DNS resolution for upstream endpoints | Praxis parsed upstream addresses as `IP:port` only. MaaS ExternalModel uses DNS hostnames like `api.openai.com:443`. Added `ToSocketAddrs` fallback in `upstream_peer.rs`. |
+| `9888295` | `request_set` / `request_remove` on header filter | Praxis could only `request_add` headers. MaaS needs Host and Authorization headers *replaced*, not appended. Without `request_set`, Cloudflare rejects duplicate Host headers and OpenAI rejects duplicate Authorization. Added `request_set` and `request_remove` to `HeaderFilter`, wired through `HttpFilterContext.remove_request_headers` and the protocol layer's `RequestHeaderOps`. |
+| `e7744c2` | StreamBuffer body forwarding fix | After `model_to_header` inspects the body and returns `Release`, post-Release chunks were discarded from the replay buffer. The upstream received an empty or truncated body. Removed the `!released` guard on `buffer.push()` in `stream_buffer.rs` so all chunks are buffered regardless of Release state. |
+| `a235509` | Pingora dependency update | Points `Cargo.toml` to `nerdalert/pingora` fork which includes the initial-send fix for body replay after StreamBuffer pre-read. |
+
+### 2. Pingora — [`nerdalert/pingora`](https://github.com/nerdalert/pingora/tree/feat/streambuffer-initial-send)
+
+Branch: `feat/streambuffer-initial-send`
+
+| Commit | Change | Why |
+|--------|--------|-----|
+| `0482d58` | Initial body send when downstream already done | After Praxis pre-reads the full body during StreamBuffer inspection, Pingora's downstream is marked as "done." Pingora's transport layer only performed an initial body send for retry buffers or empty bodies — it skipped the case where downstream was already consumed. Without this, Pingora entered `read_body_or_idle(done=true)` which called `idle()` and waited for the TCP connection to close. The upstream never received the body. Added `should_send_initial_body()` helper that also triggers when `downstream_done == true`. Applied to h1, h2, and custom transport paths. |
+
+Note: Praxis already depended on a custom Pingora fork
+(`praxis-proxy/pingora`) for ServerConfig and WrappedX509
+patches. The `nerdalert/pingora` fork is based on that
+same branch with one additional commit.
+
+### 3. MaaS — runtime patches (no source changes)
+
+These are cluster-time patches applied during deployment.
+No changes to the `models-as-a-service` repository.
+
+| Patch | What | Why |
+|-------|------|-----|
+| Authorino TLS workaround | Replace operator-managed TLS args with explicit cert paths, mount OpenShift service serving cert | The Authorino operator generates TLS config that doesn't match the wasm plugin's expectations. Gateway returns 500 with `gRPC status code is not OK`. |
+| Authorino operator scale 0/1/0 | Briefly scale operator to 1 for CR status reconciliation, then back to 0 | Kuadrant policy controller requires Authorino CR `status.Ready=True` to enforce AuthPolicies. The operator must run briefly to set this status. Without it, all AuthPolicies show `Enforced: False` and routes return 404. |
+| gpt-4o HTTPRoute backendRef patch | Change backendRef from `gpt-4o:443` (ExternalName) to `praxis-gateway:8080` | Routes the MaaS model path through Praxis instead of directly to the ExternalName Service. This is the key integration point — MaaS auth + subscription policies stay attached to the HTTPRoute while Praxis handles the provider egress. |
+| Istio sidecar injection removed | Remove `istio-injection=enabled` label from `llm` namespace | Istio sidecar injection causes init container hangs for the Python echo backends and Praxis pods. Praxis handles its own upstream TLS. |
 
 ## What Praxis Replaces
 
 | MaaS Component | What it does | Praxis replacement | Status |
 |---|---|---|---|
-| ext-proc gRPC sidecar | Separate process for body inspection | Eliminated — inline in Praxis | **Done** |
-| EnvoyFilter for ext-proc | Wires ext-proc into Envoy | Eliminated — not needed | **Done** |
-| body-field-to-header plugin | Extracts `model` from JSON body → header | `model_to_header` filter | **Done** |
-| model-provider-resolver plugin | Maps model name → provider endpoint | `router` filter (static config) | **Done** |
-| apikey-injection plugin | Injects provider API key | `request_set` filter | **Done** |
-| ExternalName Service | DNS-based routing to provider | Praxis upstream TLS with DNS resolution | **Done** |
-| Envoy upstream routing | Routes to backend by header | `router` + `load_balancer` | **Done** |
+| ext-proc gRPC sidecar | Separate pod for body inspection via gRPC | Eliminated — Praxis inspects body inline via StreamBuffer | **Done** |
+| EnvoyFilter for ext-proc | Istio CRD wiring ext-proc into gateway Envoy | Eliminated — not needed | **Done** |
+| body-field-to-header plugin | Reads request body over gRPC, extracts `model` field, returns header mutation | `model_to_header` filter — reads body in-process, promotes field to header | **Done** |
+| model-provider-resolver plugin | Watches MaaS CRDs at runtime, resolves model name → provider endpoint + transport config | `router` filter with static YAML config — model→cluster mapping defined at deploy time | **Done** (static only) |
+| apikey-injection plugin | Reads provider credential from K8s Secret via CRD reference, injects as Authorization header | `request_set` filter — overwrites Authorization header with static value from ConfigMap | **Done** (static only) |
+| ExternalName Service | Kubernetes DNS-based routing to external provider hostname | Praxis `load_balancer` with DNS resolution + upstream TLS + SNI | **Done** |
+| Envoy upstream routing | Routes by `X-Gateway-Model-Name` header to ExternalName backend | Praxis `router` matches by path/header, `load_balancer` selects endpoint | **Done** |
 
 ## What Is NOT Replaced
 
 | MaaS Component | What it does | Status |
 |---|---|---|
-| Authorino | API key validation, K8s token auth, OPA policies | **Unchanged** — runs before Praxis |
-| Limitador | Token rate limiting per subscription | **Unchanged** — runs before Praxis |
-| maas-api | API key minting, subscription management | **Unchanged** |
-| MaaS controller | Reconciles ExternalModel/MaaSModelRef CRDs | **Unchanged** |
-| MaaS CRDs | ExternalModel, MaaSModelRef, MaaSAuthPolicy, MaaSSubscription | **Unchanged** |
-| KServe | LLMInferenceService lifecycle, HTTPRoute creation | **Unchanged** |
-| api-translation plugin | Provider schema translation (OpenAI ↔ Anthropic) | **Not implemented** in Praxis |
-| model-provider-resolver (dynamic) | Runtime CRD-driven model→endpoint resolution | **Static config** only — needs config adapter for dynamic |
-| Secret-backed credentials | API key from K8s Secret at runtime | **Static config** — key injected at deploy time |
+| Authorino | API key validation, K8s token auth, subscription checks, OPA authorization | **Unchanged** — runs at gateway level before traffic reaches Praxis |
+| Limitador | Per-subscription token rate limiting | **Unchanged** — enforced by gateway wasm plugin |
+| maas-api | REST API for key minting, subscription management, model catalog | **Unchanged** |
+| MaaS controller | Reconciles ExternalModel → HTTPRoute + Service + AuthPolicy + TRLP | **Unchanged** — creates the routes that Praxis backend-patches |
+| KServe | LLMInferenceService lifecycle, in-cluster model deployment, HTTPRoute creation | **Unchanged** — handles the facebook/opt-125m simulator route directly |
+| MaaS CRDs | ExternalModel, MaaSModelRef, MaaSAuthPolicy, MaaSSubscription | **Unchanged** — all CRD semantics preserved |
+| api-translation plugin | Transforms request/response body between provider schemas (OpenAI ↔ Anthropic ↔ Mistral) | **Not implemented** — only matters for multi-provider routing |
+| model-provider-resolver (dynamic) | Runtime CRD-driven model→endpoint resolution with watch | **Static config** — needs a config adapter sidecar for dynamic resolution |
+| Secret-backed credential injection | Reads API key from K8s Secret referenced by ExternalModel CR | **Static config** — key injected into ConfigMap at deploy time via `deploy.sh` |
 
-## Request Flow
+## Request Flows
 
-### ExternalModel (gpt-4o → OpenAI via Praxis)
+### Flow 1: ExternalModel via MaaS API key (gpt-4o → OpenAI)
 
-```
-1. Client POST /llm/gpt-4o/v1/chat/completions
-   Authorization: Bearer sk-oai-<maas-api-key>
-
-2. Gateway → Authorino validates MaaS API key + subscription
-
-3. HTTPRoute /llm/gpt-4o → backendRef praxis-gateway:8080
-   (patched from ExternalName Service to Praxis)
-
-4. Praxis path_rewrite: /llm/gpt-4o/v1/chat/completions → /v1/chat/completions
-
-5. Praxis request_set: Authorization → Bearer sk-proj-<openai-key>
-                        Host → api.openai.com
-
-6. Praxis router → cluster "openai"
-   load_balancer → DNS resolve api.openai.com → upstream TLS (SNI)
-
-7. OpenAI responds → Praxis → Gateway → Client
-```
-
-### LLMInferenceService (facebook/opt-125m → in-cluster simulator)
+This is the primary integration path. The client uses a
+MaaS API key minted via subscription. Authorino validates
+the key. The HTTPRoute is patched to route to Praxis
+instead of the ExternalName Service. Praxis handles path
+rewriting, credential swap, DNS resolution, and TLS.
 
 ```
-1. Client POST /llm/facebook-opt-125m-cpu/v1/chat/completions
-   Authorization: Bearer sk-oai-<maas-api-key>
+1. Client sends request
+   POST https://maas.apps.<cluster>/llm/gpt-4o/v1/chat/completions
+   Headers:
+     Authorization: Bearer sk-oai-<maas-api-key>
+     Content-Type: application/json
+   Body: {"model":"gpt-4o","messages":[{"role":"user","content":"hello"}],"max_tokens":5}
 
-2. Gateway → Authorino validates MaaS API key + subscription
+2. DNS resolves gateway hostname → AWS ELB → Envoy gateway pod
 
-3. KServe HTTPRoute /llm/facebook-opt-125m-cpu → workload Service :8000
-   (no Praxis in this path — KServe routes directly)
+3. Envoy runs Kuadrant wasm plugin
+   → gRPC call to Authorino (TLS on port 50051)
+   → Authorino validates sk-oai-* API key via maas-api /internal/v1/api-keys/validate
+   → Checks subscription status and group membership via OPA
+   → Limitador checks per-subscription token rate limit
+   → Auth response injects identity headers for downstream
 
-4. Simulator responds → Gateway → Client
+4. HTTPRoute "gpt-4o" (created by MaaS ExternalModel reconciler)
+   Rule: PathPrefix /llm/gpt-4o → backendRef praxis-gateway:8080
+   *** PATCHED: original backendRef was gpt-4o:443 (ExternalName) ***
+   Filter: RequestHeaderModifier sets Host: api.openai.com
+   Associated policies (attached to HTTPRoute, not backend):
+     - AuthPolicy "maas-auth-gpt-4o": API key + subscription validation
+     - TokenRateLimitPolicy "maas-trlp-gpt-4o": per-subscription token quota
+   Envoy forwards request (plain HTTP) to Praxis Service ClusterIP :8080
+
+5. Praxis receives on listener :8080
+   Filter chain: observability → normalize → inject-credentials → route
+
+6. Filter: path_rewrite
+   Condition: path_prefix "/llm/gpt-4o/"
+   Action: strips prefix → /llm/gpt-4o/v1/chat/completions → /v1/chat/completions
+
+7. Filter: headers (request_set)
+   Overwrites Authorization: Bearer sk-oai-<maas-key> → Bearer sk-proj-<openai-key>
+   Overwrites Host: api.openai.com (redundant — gateway already set this,
+   but Praxis sets it explicitly for the upstream TLS connection)
+
+8. Filter: router
+   Matches path_prefix "/" → selects cluster "openai"
+
+9. Filter: load_balancer
+   Cluster "openai" endpoint: api.openai.com:443
+   DNS resolves api.openai.com → Cloudflare IP (e.g. 172.66.x.x)
+   Establishes upstream TLS with SNI: api.openai.com
+
+10. Pingora sends request to api.openai.com:443
+    POST /v1/chat/completions (rewritten path)
+    Host: api.openai.com
+    Authorization: Bearer sk-proj-<openai-key> (swapped credential)
+    Body: original JSON forwarded intact
+
+11. OpenAI processes request → returns completion
+
+12. Response flows: OpenAI → Praxis → Envoy gateway → Client
+    Client receives: {"model":"gpt-4o-2024-08-06","choices":[{"message":{"content":"Ok."}}],...}
 ```
 
-### BBR Replacement (body routing to mock backends)
+### Flow 2: ExternalModel via direct Praxis path (/praxis-gw/)
+
+Same as Flow 1 but bypasses MaaS auth. Uses a K8s token
+with audience `maas-default-gateway-sa` for gateway auth.
+Useful for testing the Praxis routing path independently
+of MaaS subscription management.
 
 ```
-1. Client POST /praxis/v1/chat/completions/
-   Body: {"model":"qwen","messages":[...]}
+1. Client POST https://<gateway>/praxis-gw/v1/chat/completions
+   Authorization: Bearer <k8s-token> (audience: maas-default-gateway-sa)
+
+2. Gateway → Authorino validates K8s token (Praxis-specific AuthPolicy)
+
+3. HTTPRoute "praxis-gateway-demo" → praxis-gateway:8080
+   AuthPolicy: simple K8s token check (no subscription)
+   TokenRateLimitPolicy: 100 req/min flat
+
+4. Praxis: path_rewrite strips /praxis-gw → /v1/chat/completions
+5. Praxis: request_set swaps Auth + Host
+6. Praxis: router → openai cluster → DNS → TLS → api.openai.com
+7. OpenAI responds → Client
+```
+
+### Flow 3: BBR replacement (body routing to mock backends)
+
+Proves that Praxis can read the request body, extract
+routing signals, make a routing decision, and forward
+the complete original body to the selected upstream.
+This is the core capability that replaces ext-proc/BBR.
+
+```
+1. Client POST https://<gateway>/praxis/v1/chat/completions/
    Authorization: Bearer <k8s-token>
+   Body: {"model":"qwen","messages":[{"role":"user","content":"hello"}]}
 
 2. Gateway → Authorino validates K8s token
 
-3. HTTPRoute /praxis → praxis:8080
+3. HTTPRoute "praxis-bbr-demo" → praxis:8080
 
-4. Praxis model_to_header: reads body via StreamBuffer,
-   extracts "model" → X-AI-Model: qwen
+4. Praxis: model_to_header filter activates StreamBuffer mode
+   a. Reads request body chunks from downstream connection
+   b. Pushes ALL chunks into buffer (including post-Release)
+   c. Parses JSON, extracts "model" field → "qwen"
+   d. Promotes to header: X-AI-Model: qwen
+   e. Filter returns Release
+   f. Buffer frozen into pre_read_body deque
 
-5. Praxis router: matches header → cluster "qwen"
-   load_balancer → echo-qwen pod
+5. Praxis: router matches X-AI-Model: qwen → cluster "qwen"
+   load_balancer selects echo-qwen pod by ClusterIP
 
-6. Body replayed to upstream via request_body_filter
+6. Pingora connects to echo-qwen:8080
+   Downstream is already done (body consumed in step 4)
+   *** PINGORA FIX: should_send_initial_body(downstream_done=true) ***
+   Calls request_body_filter → Praxis pops pre_read_body deque
+   Sends complete body to upstream
 
-7. Echo backend reads body, returns forwarded_model + forwarded_prompt
+7. Echo backend (Python HTTP server) reads body via Content-Length
+   Parses JSON, extracts model + messages[0].content
+   Returns: {"model":"qwen","forwarded_model":"qwen","forwarded_prompt":"hello",...}
+
+8. Validation script checks:
+   - .model == "qwen" (backend identity)
+   - .forwarded_model == "qwen" (body arrived, model field intact)
+   - .forwarded_prompt == "hello" (body arrived, message content intact)
 ```
 
-## Praxis Features Required
+### Flow 4: LLMInferenceService (in-cluster model)
 
-Branch: [`nerdalert/praxis` `feat/dns-and-request-headers`](https://github.com/nerdalert/praxis/tree/feat/dns-and-request-headers)
+The facebook/opt-125m simulator runs in-cluster via
+KServe. This path does NOT go through Praxis — KServe
+manages the HTTPRoute and routes directly to the workload.
+MaaS auth and subscription policies still apply.
 
-| Feature | What it does |
-|---------|-------------|
-| DNS resolution | Upstream endpoints accept hostnames |
-| `request_set` / `request_remove` | Overwrite or remove request headers before upstream |
-| StreamBuffer body forwarding | All body chunks buffered for replay after inspection |
+```
+1. Client POST https://<gateway>/llm/facebook-opt-125m-cpu/v1/chat/completions
+   Authorization: Bearer sk-oai-<maas-api-key>
 
-Image: `ghcr.io/nerdalert/praxis:maas-dev` (public)
+2. Gateway → Authorino validates API key + subscription
+
+3. KServe HTTPRoute → workload Service :8000
+   URLRewrite: /llm/facebook-opt-125m-cpu/v1/chat/completions → /v1/chat/completions
+   Backend: facebook-opt-125m-cpu-kserve-workload-svc (in-cluster, HTTPS)
+
+4. Simulator (llm-d-inference-sim) processes request
+   Returns simulated completion with random tokens
+
+5. Response → Gateway → Client
+```
+
+## StreamBuffer Body Forwarding
+
+The StreamBuffer fix is the most significant technical
+change. See [docs/streambuffer.md](../../docs/streambuffer.md)
+for the full analysis.
+
+**The problem:** Praxis reads the request body to extract
+routing signals, but the upstream must still receive the
+complete original body.
+
+**Two fixes required:**
+
+1. **Praxis** (`stream_buffer.rs`): buffer ALL chunks
+   regardless of filter Release state. Previously,
+   post-Release chunks were consumed from downstream but
+   not stored for replay.
+
+2. **Pingora** (`proxy_h1.rs`, `proxy_h2.rs`,
+   `proxy_custom.rs`): trigger the initial body send when
+   downstream is already done. Without this, Pingora
+   enters `idle()` waiting for the TCP connection to close
+   instead of calling `request_body_filter()` where Praxis
+   replays the buffered body.
+
+## BBR Plugin Replacement Detail
+
+### body-field-to-header → `model_to_header`
+
+| Aspect | BBR (ext-proc) | Praxis |
+|---|---|---|
+| Where body is read | ext-proc pod over gRPC | Inline via StreamBuffer |
+| Latency | gRPC round-trip per request | Zero — same process |
+| Field extraction | Plugin arg: `fieldName`, `headerName` | YAML config: `header` field |
+| Nested fields | Top-level only | Top-level only |
+| Body forwarding | Envoy manages via ext-proc stream | Praxis buffers + replays from deque |
+
+### model-provider-resolver → `router`
+
+| Aspect | BBR (ext-proc) | Praxis |
+|---|---|---|
+| Model→endpoint mapping | Dynamic from ExternalModel CRD (K8s watch) | Static YAML config |
+| Runtime updates | Automatic via CRD reconciliation | Requires ConfigMap update + restart |
+| Multi-model | Automatic from CRD inventory | Manual route/cluster per model |
+
+### apikey-injection → `request_set`
+
+| Aspect | BBR (ext-proc) | Praxis |
+|---|---|---|
+| Credential source | K8s Secret via ExternalModel credentialRef | Static value in ConfigMap |
+| Secret refresh | Watches Secret for rotation | Requires redeploy |
+| Header operation | Remove client key + inject provider key | Overwrite via `request_set` |
+
+### api-translation — not implemented
+
+| Aspect | BBR (ext-proc) | Praxis |
+|---|---|---|
+| Request body rewrite | Per-provider schema translation | Not available |
+| Response normalization | Normalizes to client format | Not available |
+| When it matters | Multi-provider routing (OpenAI→Anthropic) | Only matters if providers differ |
 
 ## Deploy
 
 ```bash
-# Prerequisites: MaaS deployed, ExternalModel created (see docs/install.md)
+# Prerequisites: MaaS deployed, ExternalModel created
+# See docs/install.md for the full runbook
 
 OPENAI_API_KEY='sk-...' ./demos/maas-praxis/deploy.sh
 ```
+
+The deploy script:
+1. Creates `llm` namespace (removes Istio injection label)
+2. Deploys BBR replacement manifests (echo backends + Praxis)
+3. Patches ClusterIPs into Praxis config
+4. Deploys provider gateway manifests (Praxis → OpenAI)
+5. Injects OpenAI API key into gateway ConfigMap
+6. Patches gpt-4o HTTPRoute backendRef to `praxis-gateway:8080`
 
 ## Validate
 
@@ -141,6 +344,8 @@ PROVIDER GATEWAY — gpt-4o via Praxis → OpenAI
   PASS  provider route no auth rejected: HTTP 401
 
 MAAS MODEL PATH — gpt-4o with MaaS API key through Praxis
+  MaaS API key: sk-oai-...
+  {"model":"gpt-4o-2024-08-06","choices":[{"message":{"content":"Ok."}}],...}
   PASS  gpt-4o via MaaS API key: HTTP 200
   PASS  bogus key rejected: HTTP 403
   PASS  no auth rejected: HTTP 401
@@ -148,10 +353,21 @@ MAAS MODEL PATH — gpt-4o with MaaS API key through Praxis
 Results: 8 passed, 0 failed, 0 skipped
 ```
 
-## Additional validation scripts
+## Additional Validation Scripts
 
 | Script | What it tests |
 |--------|--------------|
-| `scripts/validate-all.sh` | Full suite including all demos + MaaS auth flow |
-| `scripts/validate-maas-path-gpt.sh` | gpt-4o MaaS path in detail (8 tests) |
-| `scripts/validate-maas-all-models.sh` | All models: gpt-4o + facebook/opt-125m simulator |
+| `scripts/validate-all.sh` | Full suite: BBR + provider gateway + MaaS auth (13 tests) |
+| `scripts/validate-maas-path-gpt.sh` | gpt-4o MaaS path in detail: API key, K8s token, model listing, auth rejection (8 tests) |
+| `scripts/validate-maas-all-models.sh` | All models: gpt-4o (ExternalModel via Praxis) + facebook/opt-125m (LLMInferenceService via KServe) (7 tests) |
+
+## Known Issues
+
+| Issue | Detail | Workaround |
+|-------|--------|------------|
+| Authorino AuthPolicy enforcement | Kuadrant requires Authorino CR `status.Ready=True`. Scaling the operator to 0 leaves status stale. AuthPolicies show `Enforced: False` and routes 404. | Scale operator to 1 briefly, wait 30s, scale back to 0. See `docs/install.md` §3. |
+| Transient 404 after Authorino restart | Gateway wasm plugin has stale gRPC connection after Authorino restarts. First request may 404. | Self-heals within 30-60s as connection pool recycles. |
+| gpt-4o HTTPRoute reconciliation | MaaS controller may revert the backendRef patch on ExternalModel update. | Re-run `deploy.sh` or re-apply the patch. |
+| Istio sidecar injection | Echo backends and Praxis pods hang in `Init:1/2` if `llm` namespace has `istio-injection=enabled`. | Deploy scripts remove the label automatically. |
+| sed key corruption | `sed` corrupts API keys containing certain character sequences during ConfigMap injection. | Deploy script uses bash parameter expansion `${CONFIG//placeholder/$value}` instead. |
+| StreamBuffer + external TLS combined | Body inspection (`model_to_header`) and external provider routing work in separate paths. Combining them in a single hop requires both the Praxis and Pingora fixes. | Both fixes are included in the current image. |
