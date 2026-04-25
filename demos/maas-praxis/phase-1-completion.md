@@ -57,10 +57,11 @@ AFTER:
     → provider
 ```
 
-**Removed:** ext-proc pod, EnvoyFilter CRD, DestinationRule,
-payload-processing ServiceAccount + RBAC, ExternalName
-Service. Net reduction: 7 Kubernetes resources and 1
-running pod.
+**No longer in the active request path:** ext-proc pod,
+EnvoyFilter CRD, DestinationRule, payload-processing
+ServiceAccount + RBAC, ExternalName Service. These
+resources are not deleted but are bypassed by the POC —
+the gpt-4o HTTPRoute backendRef is patched to Praxis.
 
 ## Patches Required
 

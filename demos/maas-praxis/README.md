@@ -402,11 +402,11 @@ Results: 8 passed, 0 failed, 0 skipped
 | Phase | Target | What moves into Praxis | What it eliminates | GitHub Issues | Status |
 |-------|--------|----------------------|-------------------|---------------|--------|
 | **1** | ext-proc/BBR replacement | Body extraction, model routing, credential injection, provider TLS egress | ext-proc pod, EnvoyFilter, DestinationRule, ExternalName Service, payload-processing RBAC | — | **Complete** ([details](phase-1-completion.md)) |
-| **2** | Descriptor request limiting | Request-admission limits keyed by trusted subscription, user, model, route, or workspace descriptors | Only request-count-style Limitador usage on Praxis-owned routes; not token quotas | #8, #48, new descriptor-limit issue | Not started |
-| **2** | Prometheus metrics | `/metrics` endpoint on admin listener | — (additive) | #8 | Not started |
-| **2** | Per-filter failure modes | Configurable fail-open/fail-closed per filter | — (additive) | #48 | Not started |
-| **2b** | Targeted inline / ext-auth | JWT/JWKS where applicable; `maas-api` validation bridge for opaque `sk-oai-*` API keys | Authorino only on targeted Praxis-owned routes after behavior parity | #12, #14, new MaaS API-key validation issue | Not started |
-| **3** | Eliminate Kuadrant wasm plugin on Praxis-owned routes | Auth + request controls handled by Praxis | Kuadrant wasm plugin, WasmPlugin CRD, Authorino operator, partial Limitador dependency | Depends on Phase 2 + 2b | Not started |
+| **2** | Descriptor request limiting | Request-admission limits keyed by trusted subscription, user, model, route, or workspace descriptors | Only request-count-style Limitador usage on Praxis-owned routes; not token quotas | #8, #48, new descriptor-limit issue | **Complete** ([details](../maas-praxis-phase2/)) |
+| **2** | Prometheus metrics | `/metrics` endpoint on admin listener | — (additive) | #8 | **Complete** |
+| **2** | Per-filter failure modes | Configurable fail-open/fail-closed per filter | — (additive) | #48 | **Complete** |
+| **2b** | Targeted inline / ext-auth | `maas-api` validation bridge for opaque `sk-oai-*` API keys; metadata injection | Authorino only on targeted Praxis-owned routes after behavior parity | #12, #14 | **Code complete** (not yet cluster-deployed as Authorino replacement) |
+| **3** | Eliminate Kuadrant wasm on one targeted route | Auth + request controls handled by Praxis on shadow route | Kuadrant wasm plugin bypassed on that route | Depends on Phase 2 + 2b | In progress |
 | **3b** | Token counting + token-aware limits | Prompt/completion token counting, per-descriptor token quotas, shared state backend | Limitador for token-quota enforcement | #20, #21 | Not started |
 | **4** | Praxis as the gateway | TLS termination, HTTP/2, HTTP/3, WebSocket, Gateway API | Envoy gateway, Istio gateway pods, all EnvoyFilter/WasmPlugin CRDs | #7, #33, #39 | Not started |
 
