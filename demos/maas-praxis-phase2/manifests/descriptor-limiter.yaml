@@ -1,0 +1,198 @@
+# Descriptor Rate Limiter Demo
+#
+# Adds a descriptor-based rate limiter to the BBR replacement
+# Praxis instance. Uses trusted headers for descriptor sources.
+#
+# This is local request-count limiting only — not token quotas,
+# not distributed state, not a Limitador replacement.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-descriptor-config
+  namespace: llm
+data:
+  config.yaml: |
+    admin:
+      address: "0.0.0.0:9901"
+      verbose: true
+    insecure_options:
+      allow_public_admin: true
+    listeners:
+      - name: default
+        address: "0.0.0.0:8080"
+        filter_chains:
+          - observability
+          - classify
+          - limit
+          - route
+    filter_chains:
+      - name: observability
+        filters:
+          - filter: request_id
+          - filter: access_log
+      - name: classify
+        filters:
+          - filter: model_to_header
+            header: X-AI-Model
+      - name: limit
+        filters:
+          - filter: rate_limit
+            mode: descriptor
+            rate: 0.001
+            burst: 1
+            descriptor:
+              name: maas-subscription-model
+              trusted_headers: true
+              sources:
+                - header: X-MaaS-Subscription
+                - header: X-AI-Model
+              missing: reject
+      - name: route
+        filters:
+          - filter: router
+            routes:
+              - path_prefix: "/praxis-desc/v1/chat/completions/"
+                headers:
+                  x-ai-model: "qwen"
+                cluster: qwen
+              - path_prefix: "/praxis-desc/v1/chat/completions/"
+                headers:
+                  x-ai-model: "mistral"
+                cluster: mistral
+              - path_prefix: "/"
+                cluster: default
+          - filter: load_balancer
+            clusters:
+              - name: qwen
+                endpoints:
+                  - "QWEN_CLUSTER_IP:8080"
+              - name: mistral
+                endpoints:
+                  - "MISTRAL_CLUSTER_IP:8080"
+              - name: default
+                endpoints:
+                  - "QWEN_CLUSTER_IP:8080"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis-descriptor
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: praxis-descriptor
+  template:
+    metadata:
+      labels:
+        app: praxis-descriptor
+    spec:
+      containers:
+        - name: praxis
+          image: ghcr.io/nerdalert/praxis:maas-phase2
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9901
+          volumeMounts:
+            - name: config
+              mountPath: /etc/praxis/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+          livenessProbe:
+            httpGet:
+              path: /healthy
+              port: admin
+      volumes:
+        - name: config
+          configMap:
+            name: praxis-descriptor-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis-descriptor
+  namespace: llm
+spec:
+  selector:
+    app: praxis-descriptor
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: admin
+      port: 9901
+      targetPort: 9901
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: praxis-descriptor-demo
+  namespace: llm
+spec:
+  parentRefs:
+    - name: maas-default-gateway
+      namespace: openshift-ingress
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /praxis-desc
+      backendRefs:
+        - name: praxis-descriptor
+          port: 8080
+---
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: praxis-descriptor-auth
+  namespace: llm
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: praxis-descriptor-demo
+  rules:
+    authentication:
+      kubernetes-tokens:
+        kubernetesTokenReview:
+          audiences:
+            - maas-default-gateway-sa
+        metrics: false
+        priority: 0
+    authorization:
+      allow-authenticated:
+        metrics: false
+        opa:
+          allValues: false
+          rego: |
+            allow {
+              input.auth.identity.user.username != ""
+            }
+        priority: 0
+---
+apiVersion: kuadrant.io/v1alpha1
+kind: TokenRateLimitPolicy
+metadata:
+  name: praxis-descriptor-allow
+  namespace: llm
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: praxis-descriptor-demo
+  limits:
+    allow-descriptor:
+      counters:
+        - expression: auth.identity.userid
+      rates:
+        - limit: 1000
+          window: 1m
