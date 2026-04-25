@@ -1,0 +1,154 @@
+# Phase 3A: Praxis with inline auth + rate limiting + provider routing
+#
+# Praxis owns auth (http_ext_auth → maas-api), rate limiting
+# (descriptor mode), credential injection, and provider routing.
+# Kuadrant wasm/Authorino/Limitador are still mechanically present
+# via pass-through policies on maas-default-gateway — Praxis does
+# not need them; they exist only because the shared gateway has
+# gateway-level default-deny policies.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-phase3-config
+  namespace: llm
+data:
+  config.yaml: |
+    admin:
+      address: "0.0.0.0:9901"
+      verbose: true
+    insecure_options:
+      allow_public_admin: true
+    listeners:
+      - name: default
+        address: "0.0.0.0:8080"
+        filter_chains:
+          - observability
+          - auth
+          - limit
+          - normalize
+          - inject-credentials
+          - route
+    filter_chains:
+      - name: observability
+        filters:
+          - filter: request_id
+          - filter: access_log
+      - name: auth
+        filters:
+          - filter: http_ext_auth
+            endpoint: "https://maas-api.opendatahub.svc.cluster.local:8443/internal/v1/api-keys/validate"
+            timeout_ms: 2000
+            tls_skip_verify: true  # DEV ONLY: production must use real certs or mount the OpenShift serving CA
+            response:
+              metadata:
+                auth.user_id: userId
+                auth.username: username
+                auth.key_id: keyId
+                auth.subscription: subscription
+              upstream_headers:
+                x-maas-subscription: subscription
+            strip:
+              request_headers:
+                - authorization
+      - name: limit
+        filters:
+          - filter: rate_limit
+            mode: descriptor
+            rate: 10
+            burst: 20
+            descriptor:
+              name: praxis-auth-subscription
+              sources:
+                - context: auth.subscription
+              missing: skip  # DEV: production should use 'reject' to enforce rate limits when metadata is missing
+            failure_mode: open  # DEV: production should use 'closed' (default) to fail requests on rate limiter errors
+      - name: normalize
+        filters:
+          - filter: path_rewrite
+            strip_prefix: "/praxis-maas/gpt-4o"
+            conditions:
+              - when:
+                  path_prefix: "/praxis-maas/gpt-4o/"
+      - name: inject-credentials
+        filters:
+          - filter: headers
+            request_set:
+              - name: "Authorization"
+                value: "Bearer OPENAI_API_KEY_PLACEHOLDER"
+              - name: "Host"
+                value: "api.openai.com"
+            request_remove:
+              - "x-maas-subscription"
+      - name: route
+        filters:
+          - filter: router
+            routes:
+              - path_prefix: "/"
+                cluster: openai
+          - filter: load_balancer
+            clusters:
+              - name: openai
+                endpoints:
+                  - "api.openai.com:443"
+                tls:
+                  sni: "api.openai.com"
+                  verify: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis-phase3
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: praxis-phase3
+  template:
+    metadata:
+      labels:
+        app: praxis-phase3
+    spec:
+      containers:
+        - name: praxis
+          image: ghcr.io/nerdalert/praxis:maas-phase2
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9901
+          volumeMounts:
+            - name: config
+              mountPath: /etc/praxis/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+          livenessProbe:
+            httpGet:
+              path: /healthy
+              port: admin
+      volumes:
+        - name: config
+          configMap:
+            name: praxis-phase3-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis-phase3
+  namespace: llm
+spec:
+  selector:
+    app: praxis-phase3
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: admin
+      port: 9901
+      targetPort: 9901

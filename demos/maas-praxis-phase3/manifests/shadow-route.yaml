@@ -1,0 +1,89 @@
+# Phase 3A: Shadow route for Praxis-owned auth + rate limiting
+#
+# Praxis handles auth (http_ext_auth → maas-api) and
+# request-admission (descriptor rate_limit) inline.
+#
+# The passthrough AuthPolicy and permissive TRLP below exist
+# only because maas-default-gateway has gateway-level
+# default-deny policies. Praxis does not need them — they
+# allow MaaS API keys through the gateway to reach Praxis.
+#
+# To prove Praxis works without Kuadrant entirely, use a
+# dedicated clean Gateway or port-forward (see README.md).
+#
+# The existing /llm/gpt-4o/ route remains as the control path
+# with full Kuadrant/Authorino/Limitador enforcement.
+
+---
+# Shadow HTTPRoute — no Kuadrant AuthPolicy, no TRLP
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: praxis-maas-shadow
+  namespace: llm
+spec:
+  parentRefs:
+    - name: maas-default-gateway
+      namespace: openshift-ingress
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /praxis-maas
+      backendRefs:
+        - name: praxis-phase3
+          port: 8080
+
+---
+# Passthrough AuthPolicy — accepts any bearer token,
+# delegates real validation to Praxis http_ext_auth.
+# This overrides the gateway-level K8s token requirement
+# so MaaS API keys can reach Praxis.
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: praxis-maas-shadow-auth
+  namespace: llm
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: praxis-maas-shadow
+  rules:
+    authentication:
+      passthrough:
+        plain:
+          selector: request.headers.authorization
+        metrics: false
+        priority: 0
+        when:
+          - selector: request.headers.authorization
+            operator: neq
+            value: ""
+    authorization:
+      allow-all:
+        metrics: false
+        opa:
+          allValues: false
+          rego: |
+            allow { true }
+        priority: 0
+
+---
+# Permissive TRLP — overrides gateway default-deny (0 req/min).
+# Praxis handles actual rate limiting via descriptor mode.
+apiVersion: kuadrant.io/v1alpha1
+kind: TokenRateLimitPolicy
+metadata:
+  name: praxis-maas-shadow-allow
+  namespace: llm
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: praxis-maas-shadow
+  limits:
+    passthrough:
+      rates:
+        - limit: 1000000
+          window: 1m

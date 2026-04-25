@@ -4,29 +4,31 @@ Proof-of-concept demos for [Praxis](https://github.com/praxis-proxy/praxis), an 
 
 These demos show Praxis replacing components in a MaaS (Models-as-a-Service) gateway stack — body-aware model routing, provider egress, and request classification without ext-proc or Wasm sidecars.
 
+## MaaS Integration Summary
+
+Start with [MAAS-INTEGRATION-SUMMARY.md](MAAS-INTEGRATION-SUMMARY.md) for the phase-by-phase status, request flows, component replacement matrix, known gaps, and issue map.
+
 ## Praxis Changes
 
-These demos require features on two branches:
+These demos use development images from `ghcr.io/nerdalert/praxis`.
+Phase-specific details live in the phase docs and the summary above.
 
-**[`nerdalert/praxis` `feat/dns-and-request-headers`](https://github.com/nerdalert/praxis/tree/feat/dns-and-request-headers)**
+| Phase | Praxis branch/image | Main Praxis changes |
+|---|---|---|
+| Phase 1 | [`feat/dns-and-request-headers`](https://github.com/nerdalert/praxis/tree/feat/dns-and-request-headers), `ghcr.io/nerdalert/praxis:maas-dev` | DNS upstreams, request header set/remove, StreamBuffer body forwarding |
+| Phase 2 / 3 | [`feat/maas-phase2`](https://github.com/nerdalert/praxis/tree/feat/maas-phase2), `ghcr.io/nerdalert/praxis:maas-phase2` | Metadata bag, `/metrics`, failure modes, descriptor rate limiter, HTTP ext-auth |
 
-| Feature | What it does |
-|---------|-------------|
-| **DNS resolution** | Upstream endpoints accept DNS hostnames (e.g. `api.openai.com:443`) instead of requiring IP:port |
-| **`request_set` / `request_remove`** | Header filter can overwrite or remove request headers before upstream — needed for Host rewrite and provider credential injection |
-| **StreamBuffer body forwarding** | All body chunks are buffered for replay regardless of filter Release state |
+The Praxis builds still rely on the Pingora body-forwarding work in
+[`nerdalert/pingora` `feat/streambuffer-initial-send`](https://github.com/nerdalert/pingora/tree/feat/streambuffer-initial-send).
 
-**[`nerdalert/pingora` `feat/streambuffer-initial-send`](https://github.com/nerdalert/pingora/tree/feat/streambuffer-initial-send)**
+## Demos
 
-| Feature | What it does |
-|---------|-------------|
-| **Initial body send for pre-read bodies** | Ensures `request_body_filter` is called when downstream body was consumed during pre-read, enabling body replay to upstream |
-
-Image: `ghcr.io/nerdalert/praxis:maas-dev` (public, includes all features)
-
-## Demo
-
-See [demos/maas-praxis/](demos/maas-praxis/) for the consolidated MaaS + Praxis integration demo.
+| Demo | Purpose |
+|---|---|
+| [demos/maas-praxis/](demos/maas-praxis/) | Phase 1: BBR/ext-proc replacement for body-aware routing and provider egress |
+| [demos/maas-praxis-phase2/](demos/maas-praxis-phase2/) | Phase 2: descriptor request limiter, bridge mode, and auth/rate-limit primitives |
+| [demos/maas-praxis-phase3/](demos/maas-praxis-phase3/) | Phase 3: Praxis-owned MaaS key validation and request limiting |
+| [demos/maas-praxis-phase4/](demos/maas-praxis-phase4/) | Phase 4 planning: token limits and usage accounting |
 
 ## Docs
 

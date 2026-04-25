@@ -78,6 +78,93 @@ parts of that front-door control path:
 | HTTP ext-auth | Praxis can call `maas-api` with an opaque `sk-oai-*` key and require `valid:true`. | Starts the targeted Authorino replacement path for MaaS API-key validation. Not cluster-wired yet. |
 | Shared state | Deferred. | Required before multi-replica descriptor limits or token quotas are correct. |
 
+## MaaS API-Key Auth Model
+
+Task 7 implemented the Praxis-side auth primitive used for MaaS
+API-key validation. Praxis does **not** validate `sk-oai-*` keys
+locally and does not become the key source of truth. Instead,
+Praxis acts as the enforcement point and calls `maas-api`, which
+continues to own key hashing, status, expiration, and subscription
+data.
+
+```text
+Client sends:
+Authorization: Bearer sk-oai-...
+
+Praxis http_ext_auth:
+  1. extracts the Bearer token
+  2. sends POST {"key":"sk-oai-..."} to maas-api
+     /internal/v1/api-keys/validate
+  3. requires valid:true in the response
+  4. maps returned user/key/subscription fields into filter_metadata
+  5. strips the client Authorization header before upstream
+  6. allows or rejects the request
+```
+
+This is the same validation source Authorino uses today, but moved
+into the Praxis request path. Authorino is no longer needed for this
+specific key-validation step once traffic reaches Praxis. On the
+shared MaaS gateway, Authorino may still be mechanically involved if
+Kuadrant pass-through policies are attached to get past gateway-level
+defaults; that is a gateway wiring issue, not a Praxis auth
+requirement.
+
+Auth is enabled by configuration, not globally hardcoded into
+Praxis. The `http_ext_auth` filter only runs when a listener's
+filter chain includes it:
+
+```yaml
+listeners:
+  - name: default
+    filter_chains:
+      - observability
+      - auth
+      - route
+
+filter_chains:
+  - name: auth
+    filters:
+      - filter: http_ext_auth
+        endpoint: "https://maas-api.opendatahub.svc.cluster.local:8443/internal/v1/api-keys/validate"
+        timeout_ms: 2000
+        response:
+          metadata:
+            auth.user_id: userId
+            auth.key_id: keyId
+            auth.subscription: subscription
+        strip:
+          request_headers:
+            - authorization
+```
+
+Current configurable fields:
+
+| Field | Purpose |
+|---|---|
+| `endpoint` | Auth service URL, e.g. `maas-api` validation endpoint |
+| `timeout_ms` | HTTP callout timeout |
+| `tls_skip_verify` | Dev-only TLS verification bypass |
+| `response.metadata` | JSON response fields copied into Praxis metadata |
+| `response.upstream_headers` | JSON response fields copied into upstream request headers |
+| `strip.request_headers` | Headers removed before upstream |
+| `failure_mode` | Per-filter fail-open/fail-closed behavior from the pipeline |
+
+Current hardcoded behavior inside `http_ext_auth`:
+
+| Behavior | Current value |
+|---|---|
+| Token source | `Authorization: Bearer <token>` |
+| Auth request body | `{"key":"<token>"}` |
+| Allow condition | HTTP 200 with JSON `valid: true` |
+| Invalid-key reject | `403` for `valid:false` |
+| Missing token reject | `401` |
+
+That is enough for MaaS `sk-oai-*` API-key validation, but it is
+not yet a fully generic ext-auth implementation. Generalizing token
+sources, request body shape, allow/deny fields, forwarded headers,
+and gRPC/ext_authz compatibility remains future `#14` / `#12`
+work.
+
 The important boundary: Phase 2 replaces **routing and local
 request-admission mechanics**, not the full MaaS policy system.
 Token quotas, subscription selection, distributed counters, and
@@ -210,6 +297,7 @@ client with MaaS API key
   -> Praxis
      -> http_ext_auth extracts Bearer token
      -> POST {"key":"<token>"} to maas-api /internal/v1/api-keys/validate
+     -> maas-api validates key hash/status/expiration/subscription
      -> require response valid:true
      -> map subscription/user fields into filter_metadata and/or headers
      -> strip Authorization before upstream
@@ -254,8 +342,9 @@ Remaining work before this replaces Authorino on a MaaS route:
 See [`praxxis-planning.md`](../../../praxxis-planning.md) for
 the full roadmap.
 
-| Phase | Target | Key Issues |
-|-------|--------|------------|
-| Phase 3 | Eliminate Kuadrant wasm on Praxis-owned routes | Depends on Phase 2 + 2b |
-| Phase 3b | Token counting + token-aware limits | #20, #21 |
-| Phase 4 | Praxis as the gateway | #7, #33, #39 |
+| Phase | Target | Key Issues | Status |
+|-------|--------|------------|--------|
+| Phase 3A | Praxis-owned auth + rate limiting on shadow route | Depends on Phase 2 + 2b | **Validated** ([details](../maas-praxis-phase3/)) |
+| Phase 3B | True Kuadrant bypass (dedicated clean Gateway) | Depends on Phase 3A | Not started |
+| Phase 3c | Token counting + token-aware limits | #20, #21 | Not started |
+| Phase 4 | Praxis as the gateway | #7, #33, #39 | Not started |

@@ -406,7 +406,8 @@ Results: 8 passed, 0 failed, 0 skipped
 | **2** | Prometheus metrics | `/metrics` endpoint on admin listener | — (additive) | #8 | **Complete** |
 | **2** | Per-filter failure modes | Configurable fail-open/fail-closed per filter | — (additive) | #48 | **Complete** |
 | **2b** | Targeted inline / ext-auth | `maas-api` validation bridge for opaque `sk-oai-*` API keys; metadata injection | Authorino only on targeted Praxis-owned routes after behavior parity | #12, #14 | **Code complete** (not yet cluster-deployed as Authorino replacement) |
-| **3** | Eliminate Kuadrant wasm on one targeted route | Auth + request controls handled by Praxis on shadow route | Kuadrant wasm plugin bypassed on that route | Depends on Phase 2 + 2b | In progress |
+| **3A** | Praxis-owned auth + rate limiting on shadow route | Auth (http_ext_auth → maas-api) + request-admission (descriptor rate_limit) handled by Praxis | Kuadrant auth/rate-limit *decisions* bypassed — wasm still mechanically present via pass-through policies on shared gateway | Depends on Phase 2 + 2b | **Validated** ([details](../maas-praxis-phase3/)) |
+| **3B** | True Kuadrant bypass on dedicated route | Same as 3A but on a clean Gateway with no Kuadrant policy attachment | Kuadrant wasm, Authorino, Limitador fully absent from request path | Depends on Phase 3A | Not started |
 | **3b** | Token counting + token-aware limits | Prompt/completion token counting, per-descriptor token quotas, shared state backend | Limitador for token-quota enforcement | #20, #21 | Not started |
 | **4** | Praxis as the gateway | TLS termination, HTTP/2, HTTP/3, WebSocket, Gateway API | Envoy gateway, Istio gateway pods, all EnvoyFilter/WasmPlugin CRDs | #7, #33, #39 | Not started |
 
@@ -422,12 +423,16 @@ Phase 1 (COMPLETE)
   │
   └── Phase 2 + 2b together enable:
         │
-        Phase 3: eliminate Kuadrant wasm plugin on Praxis-owned routes
+        Phase 3A: Praxis-owned auth + rate limiting (VALIDATED)
+          │  Praxis owns decisions; Kuadrant pass-through on shared gateway
           │
-          ├── Phase 3b: token counting + token limits (#20, #21)
+          ├── Phase 3B: true Kuadrant bypass (dedicated clean Gateway)
+          │     proves Praxis works without any Kuadrant components
+          │
+          ├── Phase 3c: token counting + token limits (#20, #21)
           │     requires: shared state backend (new issue)
           │
-          └── Phase 3 + 3b together enable:
+          └── Phase 3B + 3c together enable:
                 │
                 Phase 4: Praxis as the gateway (#7, #33, #39)
 ```
